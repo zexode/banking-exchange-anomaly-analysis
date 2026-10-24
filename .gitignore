@@ -1,0 +1,6 @@
+__pycache__/
+.ipynb_checkpoints/
+.venv/
+data/raw/*
+!data/raw/laramee26openBankTransactionData.xlsx
+data/processed/
