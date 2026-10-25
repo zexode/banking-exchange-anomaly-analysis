@@ -230,7 +230,23 @@ def load_binance():
     return rows
 
 
-def load_news():
+def is_current(path, sources):
+    sources = [source for source in sources if source.exists()]
+    return bool(path.exists() and sources and path.stat().st_mtime_ns >= max(source.stat().st_mtime_ns for source in sources))
+
+
+def load_news(rebuild=False):
+    cache = OUT / "news_annotated.csv.gz"
+    archives = list(NEWS_DIR.glob("*.json.xz"))
+    if not rebuild and archives and is_current(cache, archives):
+        numeric = {"sentiment_negative", "sentiment_neutral", "sentiment_positive", "word_count", "character_count"}
+        csv.field_size_limit(10_000_000)
+        with gzip.open(cache, "rt", encoding="utf-8-sig", newline="") as file:
+            rows = list(csv.DictReader(file))
+        for row in rows:
+            for field in numeric:
+                row[field] = float(row[field]) if row[field] else ""
+        return rows
     rows = []
     for path in NEWS_DIR.glob("*.json.xz"):
         with lzma.open(path, "rt", encoding="utf-8") as file:
@@ -471,6 +487,7 @@ def main():
     parser = argparse.ArgumentParser(description="Подготовка данных по пункту 2.3")
     parser.add_argument("--download", action="store_true", help="загрузить внешние источники")
     parser.add_argument("--refresh", action="store_true", help="обновить загруженные источники")
+    parser.add_argument("--rebuild", action="store_true", help="пересчитать обработанные таблицы и TF-IDF")
     args = parser.parse_args()
     bank, bank_audit = load_bank()
     start = max(date.fromisoformat(bank[0]["date"]), date(2021, 1, 1))
@@ -484,7 +501,7 @@ def main():
                 print(f"{name}: загрузка не удалась: {error}")
 
     crypto = load_binance()
-    news = load_news()
+    news = load_news(rebuild=args.rebuild)
     sec = load_sec_facts()
     sec_reports = sec_report_metrics(sec)
     sources = {"bank_transactions": bank, "binance_spot": crypto, "financial_news": news, "sec_xbrl": sec}
@@ -501,7 +518,10 @@ def main():
             p, m, n, c = profile(name, rows, cats, nums, "filed_date" if name == "sec_xbrl" else "date")
             profiles.append(p); missing += m; stats += n; categories += c
             output_name = "news_annotated.csv.gz" if name == "financial_news" else f"{name}.csv"
-            save_csv(OUT / output_name, rows)
+            target = OUT / output_name
+            inputs = list(NEWS_DIR.glob("*.json.xz")) if name == "financial_news" else [BANK_FILE] if name == "bank_transactions" else []
+            if args.rebuild or not is_current(target, inputs):
+                save_csv(target, rows)
         else:
             profiles.append({"source": name, "status": "not_downloaded", "rows": 0,
                              "categorical_fields": cats, "numeric_fields": nums})
@@ -535,8 +555,20 @@ def main():
         for field in ("Assets", "Liabilities", "NetIncomeLoss"):
             row["sec_" + field.lower()] = latest.get(field, "")
     save_csv(OUT / "integrated_monthly.csv", integrated)
-    tfidf = vectorize_news(news) if news else {"status": "not run", "reason": "новости не загружены"}
-    save_json(OUT / "text_vectorization_summary.json", tfidf)
+    summary_path = OUT / "text_vectorization_summary.json"
+    sparse_path = OUT / "news_tfidf_sparse.csv.gz"
+    vocabulary_path = OUT / "news_tfidf_vocabulary.csv"
+    news_sources = list(NEWS_DIR.glob("*.json.xz"))
+    english_count = sum(row.get("language", "").lower() == "en" for row in news)
+    if (news and not args.rebuild and is_current(sparse_path, news_sources)
+            and is_current(vocabulary_path, news_sources) and is_current(summary_path, news_sources)):
+        tfidf = json.loads(summary_path.read_text(encoding="utf-8"))
+        if tfidf.get("status") != "complete" or tfidf.get("documents") != english_count:
+            tfidf = vectorize_news(news)
+            save_json(summary_path, tfidf)
+    else:
+        tfidf = vectorize_news(news) if news else {"status": "not run", "reason": "новости не загружены"}
+        save_json(summary_path, tfidf)
     save_json(OUT / "cleaning_audit.json", [bank_audit])
     write_field_dictionary(sources, missing)
     samples = [f"## {name}\n\n" + (json.dumps(rows[:3], ensure_ascii=False, indent=2) if rows else "Источник не загружен.")
